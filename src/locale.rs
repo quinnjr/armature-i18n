@@ -329,7 +329,12 @@ struct AcceptLanguageEntry {
 
 impl PartialEq for AcceptLanguageEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.locale == other.locale && (self.quality - other.quality).abs() < f32::EPSILON
+        // Defined in terms of `cmp` so the two agree. `Eq` promises that
+        // `a == b` exactly when `a.cmp(b)` is `Equal`, and the order below
+        // ranks on quality alone: an equality that also compared the locale,
+        // or that compared quality through an epsilon window, would report
+        // pairs as unequal that the order calls equal.
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -343,17 +348,29 @@ impl PartialOrd for AcceptLanguageEntry {
 
 impl Ord for AcceptLanguageEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Higher quality first
-        other
-            .quality
-            .partial_cmp(&self.quality)
-            .unwrap_or(Ordering::Equal)
+        // Higher quality first.
+        //
+        // `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`: the latter
+        // reports every pair involving a NaN as equal, which is not transitive
+        // (`NaN == a` and `NaN == b` while `a < b`). `sort` is entitled to
+        // produce arbitrary output from a comparator that is not a total
+        // order. Quality is validated at parse time so a NaN should not reach
+        // here, but the ordering no longer depends on that holding.
+        other.quality.total_cmp(&self.quality)
     }
 }
 
 /// Parse an Accept-Language header into a list of locales.
 ///
 /// Returns locales sorted by quality (highest first).
+///
+/// The wildcard `*` is excluded, as is any entry with `q=0` — RFC 9110
+/// section 12.5.4 defines that as "not acceptable", so such an entry names a
+/// locale the client is refusing rather than one it wants. A quality outside
+/// `0..=1` is not a qvalue and is clamped into it: above `1` becomes `1`, and
+/// anything negative — including `-inf` — becomes `0` and is therefore refused
+/// like an explicit `q=0`. A quality that is not a number at all, or is `NaN`,
+/// is treated as though no `q` had been sent.
 ///
 /// # Example
 ///
@@ -365,6 +382,16 @@ impl Ord for AcceptLanguageEntry {
 /// assert_eq!(locales[0].tag(), "en-US");
 /// assert_eq!(locales[1].tag(), "en");
 /// assert_eq!(locales[2].tag(), "fr");
+/// ```
+///
+/// A refused locale is dropped rather than ranked last:
+///
+/// ```
+/// use armature_i18n::parse_accept_language;
+///
+/// let locales = parse_accept_language("de;q=0,fr");
+/// assert_eq!(locales.len(), 1);
+/// assert_eq!(locales[0].tag(), "fr");
 /// ```
 pub fn parse_accept_language(header: &str) -> Vec<Locale> {
     let mut entries: Vec<AcceptLanguageEntry> = header
@@ -383,14 +410,41 @@ pub fn parse_accept_language(header: &str) -> Vec<Locale> {
                 return None;
             }
 
-            // Parse quality
+            // Parse quality.
+            //
+            // Clamped. `str::parse::<f32>` accepts `NaN`, `inf` and any
+            // magnitude, none of which is a qvalue: RFC 9110 section 12.4.2
+            // defines one as `0[.0*3]` or `1[.0*3]`. An unbounded value would
+            // let a client outrank every other entry, and a NaN would reach
+            // the comparator, where no ordering of it is meaningful. Anything
+            // unparseable is treated as absent, which is the same as sending
+            // no `q` at all.
+            //
+            // Only NaN is rejected before the clamp, because it is the one
+            // value with no sign to honour. An infinity is clamped like any
+            // other out-of-range magnitude, so `-inf` lands on `0` and is
+            // refused exactly as `-1` is; rejecting it instead would drop it
+            // through to the `unwrap_or` below and hand the most negative
+            // quality expressible the *highest* rank.
             let quality = split
                 .next()
                 .and_then(|q| {
                     let q = q.trim();
-                    q.strip_prefix("q=").and_then(|v| v.parse().ok())
+                    q.strip_prefix("q=")
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        .filter(|q| !q.is_nan())
+                        .map(|q| q.clamp(0.0, 1.0))
                 })
                 .unwrap_or(1.0);
+
+            // `q=0` means "not acceptable" (RFC 9110 section 12.5.4), so the
+            // client is naming a locale to *exclude*. Returning it anyway
+            // inverts the request: `negotiate_locale` walks this list in order
+            // and would happily select something the client explicitly
+            // refused, whenever nothing it does accept is available.
+            if quality <= 0.0 {
+                return None;
+            }
 
             let locale = Locale::parse(tag).ok()?;
             Some(AcceptLanguageEntry { locale, quality })
@@ -500,6 +554,84 @@ mod tests {
         let locales = parse_accept_language("fr-FR,*;q=0.1");
         assert_eq!(locales.len(), 1);
         assert_eq!(locales[0].tag(), "fr-FR");
+    }
+
+    /// `q=0` is "not acceptable" (RFC 9110 section 12.5.4). Ranking such an
+    /// entry last instead of dropping it inverts the client's meaning, because
+    /// `negotiate_locale` walks the list in order and will select a refused
+    /// locale whenever nothing the client accepts is on offer.
+    #[test]
+    fn q_zero_is_a_refusal_not_a_low_preference() {
+        let locales = parse_accept_language("de;q=0,fr");
+        assert_eq!(
+            locales.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            vec!["fr"]
+        );
+
+        // The refusal must survive negotiation: with only the refused locale
+        // available, the default answers instead.
+        let available = vec![Locale::de_de()];
+        let default = Locale::en_us();
+        let best = negotiate_locale(&locales, &available, &default);
+        assert_eq!(
+            best.tag(),
+            "en-US",
+            "a locale the client refused was selected anyway"
+        );
+    }
+
+    /// `str::parse::<f32>` accepts `NaN`, `inf` and any magnitude; none is a
+    /// qvalue. An unbounded value would outrank every honest entry, and a NaN
+    /// would reach the comparator, where it is not orderable.
+    #[test]
+    fn out_of_range_and_non_numeric_qualities_are_treated_as_absent() {
+        // An out-of-range quality behaves exactly as though no `q` had been
+        // sent. That it then outranks an explicit 0.9 is not a privilege: the
+        // client could have sent `q=1`. What matters is that `q=7` cannot buy
+        // a rank *above* an honest 1.0, which clamping guarantees.
+        let clamped = parse_accept_language("en;q=0.9,de;q=7");
+        let absent = parse_accept_language("en;q=0.9,de");
+        assert_eq!(
+            clamped.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            absent.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            "an out-of-range quality should be indistinguishable from no quality"
+        );
+        let ceiling = parse_accept_language("en;q=1,de;q=99");
+        assert_eq!(
+            ceiling.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            vec!["en", "de"],
+            "a quality above 1 outranked an honest 1.0 instead of tying with it"
+        );
+
+        // NaN is not orderable; it must not reach the sort.
+        let locales = parse_accept_language("en;q=NaN,fr;q=0.5");
+        assert_eq!(
+            locales.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            vec!["en", "fr"]
+        );
+
+        // A negative quality clamps to zero, which is a refusal.
+        let locales = parse_accept_language("de;q=-1,fr");
+        assert_eq!(
+            locales.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            vec!["fr"]
+        );
+
+        // An infinity is a magnitude like any other, so it clamps by sign
+        // rather than being discarded: `-inf` must agree with `-1` and be
+        // refused, not fall back to "absent" and thereby outrank everything.
+        let locales = parse_accept_language("de;q=-inf,fr");
+        assert_eq!(
+            locales.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            vec!["fr"],
+            "the most negative quality expressible was honoured as a preference"
+        );
+        let locales = parse_accept_language("en;q=1,de;q=inf");
+        assert_eq!(
+            locales.iter().map(|l| l.tag()).collect::<Vec<_>>(),
+            vec!["en", "de"],
+            "an infinite quality outranked an honest 1.0 instead of tying with it"
+        );
     }
 
     #[test]
