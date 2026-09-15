@@ -7,6 +7,18 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
+## [Unreleased]
+
+### Changed
+
+- Bumped `icu_locale_core`, `icu_datetime`, `icu_decimal`, `icu_plurals`, and
+  `icu_calendar` from `2.2` to `2.3` as part of a workspace-wide dependency
+  upgrade. All five stay aligned on the 2.3 line with no duplicate versions in
+  the dependency graph (`cargo tree -d` is clean). No migration was needed:
+  the `icu` feature these crates gate is declared in `Cargo.toml` but not
+  referenced anywhere in this crate's source, so nothing in `src/` depends on
+  their API surface.
+
 ## [0.5.0] - 2026-08-05
 
 ### Changed
