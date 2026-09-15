@@ -9,8 +9,11 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-15
+
 ### Changed
 
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
 - Bumped `icu_locale_core`, `icu_datetime`, `icu_decimal`, `icu_plurals`, and
   `icu_calendar` from `2.2` to `2.3` as part of a workspace-wide dependency
   upgrade. All five stay aligned on the 2.3 line with no duplicate versions in
